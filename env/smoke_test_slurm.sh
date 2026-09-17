@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=pubmed_es_smoke
-#SBATCH --partition=small-creator-o
+#SBATCH --partition=small-grace-o
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=1:00:00

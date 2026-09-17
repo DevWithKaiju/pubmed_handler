@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=pubmed_es_index
-#SBATCH --partition=x-large-creator-o
+#SBATCH --partition=x-large-grace-o
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
@@ -72,6 +72,11 @@ export ES_PASSWORD=""
 export DATA_DIR="${ROOT_DIR}/data"
 export TARGETS="${TARGETS:-all}"
 
+# インデックスあたりの投入件数の上限 (0 = 無制限)。
+# お試し環境を作る場合に使う:
+#   sbatch --export=ALL,TARGETS=sentences,LIMIT=1000000 env/index_slurm.sh
+export LIMIT="${LIMIT:-0}"
+
 # 1億件規模の投入ではセグメントマージが重いため厚めに取る
 export ES_HEAP="${ES_HEAP:-8g}"
 
@@ -81,6 +86,7 @@ echo "  JOB_ID   : ${SLURM_JOB_ID}"
 echo "  ROOT_DIR : ${ROOT_DIR}"
 echo "  DATA_DIR : ${DATA_DIR}"
 echo "  TARGETS  : ${TARGETS}"
+echo "  LIMIT    : ${LIMIT} (0 = 無制限)"
 echo "  ES_HEAP  : ${ES_HEAP}"
 echo "  開始     : $(date --iso-8601=seconds)"
 echo
@@ -176,6 +182,7 @@ apptainer exec \
     --env ES_PASSWORD="${ES_PASSWORD}" \
     --env DATA_DIR="${DATA_DIR}" \
     --env TARGETS="${TARGETS}" \
+    --env LIMIT="${LIMIT}" \
     "${ENV_SIF}" \
     bash -c "
         set -euo pipefail

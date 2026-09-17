@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=pubmed_es_jupyter
-#SBATCH --partition=x-large-creator-o
+#SBATCH --partition=x-large-grace-o
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
@@ -52,8 +52,13 @@ source "${ROOT_DIR}/env/common.sh"
 ES_SIF="${ROOT_DIR}/sif/elasticsearch.sif"
 ENV_SIF="${ROOT_DIR}/env.sif"
 
+# Kibana は任意。sif が無ければスキップして JupyterLab だけで起動する
+# (Kibana を入れる前と同じ状態で使えるようにしておくため)。
+KIBANA_SIF="${ROOT_DIR}/sif/kibana.sif"
+
 LOG_DIR="${ROOT_DIR}/logs/${SLURM_JOB_ID}"
 ES_LOG="${LOG_DIR}/elasticsearch.out"
+KIBANA_LOG="${LOG_DIR}/kibana.out"
 
 mkdir -p "${LOG_DIR}"
 
@@ -115,8 +120,19 @@ echo "[INFO] Elasticsearch 起動中... (heap=${ES_HEAP}, log: ${ES_LOG})"
 setsid bash "${ROOT_DIR}/env/run_es.sh" > "${ES_LOG}" 2>&1 &
 ES_PID=$!
 
+KIBANA_PID=""
+
 cleanup() {
     echo
+
+    # Kibana は ES に繋ぎに行くので先に止める
+    if [ -n "${KIBANA_PID}" ]; then
+        echo "[INFO] Kibana 停止中 (pid=${KIBANA_PID})"
+        kill -TERM -"${KIBANA_PID}" 2>/dev/null \
+            || kill -TERM "${KIBANA_PID}" 2>/dev/null \
+            || true
+    fi
+
     echo "[INFO] Elasticsearch 停止中 (pid=${ES_PID})"
     kill -TERM -"${ES_PID}" 2>/dev/null \
         || kill -TERM "${ES_PID}" 2>/dev/null \
@@ -147,9 +163,10 @@ if [ "${READY}" -ne 1 ]; then
 fi
 
 # =====================================================
-# Jupyter の接続情報
+# 接続情報
 #
 # ポートとトークンは start_jupyter.sh と同じ方式で用意する。
+# 固定ポートにすると、同じノードを使う他のジョブと衝突する。
 # =====================================================
 
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
@@ -158,19 +175,85 @@ TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 COMPUTE_NODE=$(hostname -s)
 COMPUTE_SSH_PORT=49152
 
+# =====================================================
+# Kibana 起動 (任意)
+#
+# sif が無ければスキップする。Kibana が起動しなくても
+# JupyterLab は使えるようにしておく (ジョブは落とさない)。
+# =====================================================
+
+KIBANA_PORT=""
+
+if [ ! -f "${KIBANA_SIF}" ]; then
+    echo "[INFO] ${KIBANA_SIF} が無いため Kibana はスキップします"
+    echo "       使う場合: sbatch env/build_kibana.sh"
+    echo
+else
+    KIBANA_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+
+    echo "[INFO] Kibana 起動中... (port=${KIBANA_PORT}, log: ${KIBANA_LOG})"
+
+    KIBANA_PORT="${KIBANA_PORT}" ES_HOST="${ES_HOST}" \
+        setsid bash "${ROOT_DIR}/env/run_kibana.sh" > "${KIBANA_LOG}" 2>&1 &
+    KIBANA_PID=$!
+
+    echo "[INFO] Kibana の起動を待機中... (初回は数分かかることがある)"
+
+    KIBANA_READY=0
+
+    for i in $(seq 1 60); do
+        if curl -s -m 3 "http://localhost:${KIBANA_PORT}/api/status" | grep -q '"level":"available"'; then
+            KIBANA_READY=1
+            echo "[INFO] Kibana 起動完了"
+            break
+        fi
+        sleep 10
+    done
+
+    if [ "${KIBANA_READY}" -ne 1 ]; then
+        echo "[WARN] Kibana が 600 秒以内に起動しませんでした。JupyterLab のみで続行します。"
+        echo "----- ${KIBANA_LOG} (末尾 30 行) -----"
+        tail -n 30 "${KIBANA_LOG}" || true
+        echo "--------------------------------------"
+        KIBANA_PORT=""
+    fi
+
+    echo
+fi
+
+if [ -n "${KIBANA_PORT}" ]; then
+    TUNNEL="ssh -N -L ${PORT}:localhost:${PORT} -L ${KIBANA_PORT}:localhost:${KIBANA_PORT} -p ${COMPUTE_SSH_PORT} ${COMPUTE_NODE}"
+    SERVICES="Elasticsearch + JupyterLab + Kibana"
+else
+    TUNNEL="ssh -N -L ${PORT}:localhost:${PORT} -p ${COMPUTE_SSH_PORT} ${COMPUTE_NODE}"
+    SERVICES="Elasticsearch + JupyterLab"
+fi
+
 echo
 echo "=================================================================="
-echo "Elasticsearch + JupyterLab on: ${COMPUTE_NODE}  (job ${SLURM_JOB_ID})"
+echo "${SERVICES} on: ${COMPUTE_NODE}  (job ${SLURM_JOB_ID})"
 echo
 echo "[STEP 1: SSH トンネルを張る]"
 echo "login node で新しいターミナルを開いて実行:"
-echo "  ssh -N -L ${PORT}:localhost:${PORT} -p ${COMPUTE_SSH_PORT} ${COMPUTE_NODE}"
+echo "  ${TUNNEL}"
 echo
 echo "  * 作業中はそのターミナルを開いたままにする"
-echo "  * 'Address already in use' が出たら最初の ${PORT} を別の数字に変える"
+echo "  * 'Address already in use' が出たら -L の左側の数字を変える"
 echo
-echo "[STEP 2: JupyterLab に接続]"
-echo "  http://localhost:${PORT}/?token=${TOKEN}"
+echo "[STEP 2: ブラウザで接続]"
+echo "  JupyterLab : http://localhost:${PORT}/?token=${TOKEN}"
+
+if [ -n "${KIBANA_PORT}" ]; then
+    echo "  Kibana     : http://localhost:${KIBANA_PORT}/app/discover"
+    echo
+    echo "  Kibana は初回のみ data view の作成が必要:"
+    echo "    Stack Management > Data Views > Create data view"
+    echo "      Name         : pubmed_articles"
+    echo "      Index pattern: pubmed_articles"
+    echo "      Timestamp    : I don't want to use the time filter"
+    echo "    (pubmed_sentences も同様に作る)"
+fi
+
 echo
 echo "[STEP 3: notebook から Elasticsearch を使う]"
 echo "  ES は同じノードで動いているため、そのまま繋がる:"
@@ -181,6 +264,16 @@ echo "[自動終了]"
 echo "  無操作のカーネル/ターミナルは $((KERNEL_CULL_TIMEOUT / 60)) 分で片付けられ、"
 echo "  その状態がさらに $((IDLE_TIMEOUT / 60)) 分続くとジョブごと自動終了する。"
 echo "  (消し忘れでノードを占有しないため)"
+
+if [ -n "${KIBANA_PORT}" ]; then
+    echo
+    echo "  注意: 判定に使うのは Jupyter のカーネル/ターミナルの活動のみ。"
+    echo "        Kibana だけを使っていると無操作とみなされ、"
+    echo "        作業中でもジョブごと終了する。長く使う場合は"
+    echo "        notebook を 1 つ開いておくか、投入時に延ばすこと:"
+    echo "          sbatch --export=ALL,KERNEL_CULL_TIMEOUT=21600,IDLE_TIMEOUT=21600 env/serve_slurm.sh"
+fi
+
 echo
 echo "すぐ終了する場合: scancel ${SLURM_JOB_ID}"
 echo "=================================================================="

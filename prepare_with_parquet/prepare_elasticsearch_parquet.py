@@ -13,6 +13,7 @@
 import os
 import sys
 import time
+from itertools import islice
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -36,6 +37,12 @@ BULK_SIZE   = 5_000
 # 1億件超を1ジョブで投入すると、時間切れ時に全てやり直しになる。
 # インデックス単位でジョブを分けられるようにしておく。
 TARGETS = os.environ.get("TARGETS", "all").lower()
+
+# インデックスあたりの投入件数の上限。0 は無制限 (本番)。
+#
+# お試し環境のように少量だけ入れたい場合に使う。
+# parquet は islice で打ち切るため、8,050万行を読み切る必要はない。
+LIMIT = int(os.environ.get("LIMIT", "0"))
 
 # 長時間ジョブなので進捗を定期的に出す (秒)
 PROGRESS_INTERVAL_SEC = 60
@@ -312,11 +319,19 @@ if __name__ == "__main__":
             print(f"  [SKIP] {parquet_path} not found\n")
             continue
 
-        meta = pq.read_metadata(parquet_path)
-        print(f"  rows: {meta.num_rows:,}")
+        meta  = pq.read_metadata(parquet_path)
+        total = meta.num_rows
+        print(f"  rows: {total:,}")
+
+        actions = gen_fn(parquet_path, index_name)
+
+        if LIMIT > 0:
+            actions = islice(actions, LIMIT)
+            total   = min(total, LIMIT)
+            print(f"  LIMIT: 先頭 {total:,} 件だけ投入する")
 
         create_index(es, index_name, mapping)
-        bulk_index(es, gen_fn(parquet_path, index_name), index_name, meta.num_rows)
+        bulk_index(es, actions, index_name, total)
 
         es.indices.refresh(index=index_name)
         count = es.count(index=index_name)["count"]
