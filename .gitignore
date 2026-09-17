@@ -1,2 +1,8 @@
 data
 *.db
+sif
+logs
+.venv
+env.sif
+uv.lock
+.ipynb_checkpoints

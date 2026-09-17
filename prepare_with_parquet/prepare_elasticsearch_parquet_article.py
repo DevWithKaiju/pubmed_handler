@@ -69,18 +69,27 @@ def generate_actions(parquet_path):
     for batch in pf.iter_batches(batch_size=BULK_SIZE):
         d = batch.to_pydict()
         for i in range(len(d["pmid"])):
+            mesh     = d["mesh"][i]
+            pub_type = d["pub_type"][i]
+
             yield {
                 "_index": INDEX_NAME,
                 "_id":    d["pmid"][i],
+                # ES のフィールド名は parquet のカラム名と一致しない
+                #   abstract_lang -> language / pub_type -> publication_types
+                #
+                # mesh と pub_type は "A|B|C" 形式の文字列。分割せずに
+                # keyword へ入れると全体が1トークンになり、個別の語での
+                # 絞り込みがヒットしなくなるため split する。
                 "_source": {
                     "pmid":              d["pmid"][i],
                     "title":             d["title"][i] or "",
                     "abstract":          d["abstract"][i] or "",
                     "journal":           d["journal"][i] or "",
-                    "language":          d["language"][i] or "",
+                    "language":          d["abstract_lang"][i] or "",
                     "year":              d["year"][i],
-                    "mesh":              d["mesh"][i] or [],
-                    "publication_types": d["publication_types"][i] or [],
+                    "mesh":              mesh.split("|") if mesh else [],
+                    "publication_types": pub_type.split("|") if pub_type else [],
                     "abstract_truncated":d["abstract_truncated"][i],
                 },
             }
