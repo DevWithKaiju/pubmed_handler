@@ -11,12 +11,14 @@
 '''
 
 import os
+import sys
+import time
+from itertools import islice
 from pathlib import Path
 
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch, helpers
-from tqdm import tqdm
 
 load_dotenv()
 
@@ -28,6 +30,27 @@ ES_HOST     = os.environ.get("ES_HOST", "http://elasticsearch:9200")
 ES_USER     = os.environ.get("ES_USER", "elastic")
 ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
 BULK_SIZE   = 5_000
+
+# 投入対象を絞る: "all" | "articles" | "sentences" | "labels"
+# (カンマ区切りで複数指定可)
+#
+# 1億件超を1ジョブで投入すると、時間切れ時に全てやり直しになる。
+# インデックス単位でジョブを分けられるようにしておく。
+TARGETS = os.environ.get("TARGETS", "all").lower()
+
+# インデックスあたりの投入件数の上限。0 は無制限 (本番)。
+#
+# お試し環境のように少量だけ入れたい場合に使う。
+# parquet は islice で打ち切るため、8,050万行を読み切る必要はない。
+LIMIT = int(os.environ.get("LIMIT", "0"))
+
+# 長時間ジョブなので進捗を定期的に出す (秒)
+PROGRESS_INTERVAL_SEC = 60
+
+# 失敗の内容をログに残す件数。
+# 件数だけ数えて中身を捨てると、12時間走った後に
+# "failed=8000万" とだけ分かる事態になるため。
+MAX_LOGGED_ERRORS = 10
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 PUBMED_DIR = DATA_DIR / "260420_pubmed"
@@ -121,8 +144,19 @@ def create_index(es, index_name, mapping):
     print(f"  Index '{index_name}' created")
 
 
+def fmt_sec(sec):
+    '''秒を H:MM:SS に整形する。'''
+    sec = int(sec)
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
 def bulk_index(es, actions_iter, index_name, total):
     success, failed = 0, 0
+    errors = []
+
+    start = time.time()
+    last_report = start
+
     for ok, info in helpers.parallel_bulk(
         es,
         actions_iter,
@@ -134,7 +168,40 @@ def bulk_index(es, actions_iter, index_name, total):
             success += 1
         else:
             failed += 1
-    print(f"  {index_name}: indexed={success}, failed={failed}")
+            if len(errors) < MAX_LOGGED_ERRORS:
+                errors.append(info)
+
+        now = time.time()
+
+        if now - last_report >= PROGRESS_INTERVAL_SEC:
+            last_report = now
+
+            done    = success + failed
+            elapsed = now - start
+            rate    = done / elapsed if elapsed > 0 else 0
+            remain  = (total - done) / rate if rate > 0 else 0
+
+            # Slurm のログはバッファされるため flush する
+            print(
+                f"    {done:,}/{total:,} ({done / total * 100:5.1f}%) "
+                f"{rate:,.0f} docs/s  "
+                f"経過 {fmt_sec(elapsed)}  残り {fmt_sec(remain)}  "
+                f"失敗 {failed:,}",
+                flush=True,
+            )
+
+    elapsed = time.time() - start
+
+    print(
+        f"  {index_name}: indexed={success:,}, failed={failed:,}, "
+        f"所要 {fmt_sec(elapsed)}",
+        flush=True,
+    )
+
+    if errors:
+        print(f"  [ERROR] 失敗の内容 (最大 {MAX_LOGGED_ERRORS} 件):")
+        for e in errors:
+            print(f"    {e}")
 
 
 # =========================================================
@@ -147,18 +214,27 @@ def article_actions(parquet_path, index_name):
         df = batch.to_pydict()
         n = len(df["pmid"])
         for i in range(n):
+            mesh     = df["mesh"][i]
+            pub_type = df["pub_type"][i]
+
             yield {
                 "_index": index_name,
                 "_id":    df["pmid"][i],
+                # ES のフィールド名は parquet のカラム名と一致しない
+                #   abstract_lang -> language / pub_type -> publication_types
+                #
+                # mesh と pub_type は "A|B|C" 形式の文字列。分割せずに
+                # keyword へ入れると全体が1トークンになり、個別の語での
+                # 絞り込みがヒットしなくなるため split する。
                 "_source": {
                     "pmid":              df["pmid"][i],
                     "title":             df["title"][i] or "",
                     "abstract":          df["abstract"][i] or "",
                     "journal":           df["journal"][i] or "",
-                    "language":          df["language"][i] or "",
+                    "language":          df["abstract_lang"][i] or "",
                     "year":              df["year"][i],
-                    "mesh":              df["mesh"][i] or [],
-                    "publication_types": df["publication_types"][i] or [],
+                    "mesh":              mesh.split("|") if mesh else [],
+                    "publication_types": pub_type.split("|") if pub_type else [],
                     "abstract_truncated":df["abstract_truncated"][i],
                 },
             }
@@ -218,6 +294,22 @@ if __name__ == "__main__":
         ("LABELS",    INDEX_LABEL,    MAPPING_LABEL,    LABEL_PARQUET,    label_actions),
     ]
 
+    # TARGETS で投入対象を絞る (指定ミスは黙って無視せず落とす)
+    if TARGETS != "all":
+        wanted  = {t.strip() for t in TARGETS.split(",")}
+        known   = {name.lower() for name, *_ in tasks}
+        unknown = wanted - known
+
+        if unknown:
+            sys.exit(
+                f"TARGETS に不正な値があります: {sorted(unknown)} "
+                f"(指定できるのは all, {', '.join(sorted(known))})"
+            )
+
+        tasks = [t for t in tasks if t[0].lower() in wanted]
+
+    print(f"投入対象: {', '.join(t[0] for t in tasks)}\n")
+
     for label, index_name, mapping, parquet_path, gen_fn in tasks:
         print(f"{'='*60}")
         print(f"{label}: {parquet_path.name}")
@@ -227,11 +319,19 @@ if __name__ == "__main__":
             print(f"  [SKIP] {parquet_path} not found\n")
             continue
 
-        meta = pq.read_metadata(parquet_path)
-        print(f"  rows: {meta.num_rows:,}")
+        meta  = pq.read_metadata(parquet_path)
+        total = meta.num_rows
+        print(f"  rows: {total:,}")
+
+        actions = gen_fn(parquet_path, index_name)
+
+        if LIMIT > 0:
+            actions = islice(actions, LIMIT)
+            total   = min(total, LIMIT)
+            print(f"  LIMIT: 先頭 {total:,} 件だけ投入する")
 
         create_index(es, index_name, mapping)
-        bulk_index(es, gen_fn(parquet_path, index_name), index_name, meta.num_rows)
+        bulk_index(es, actions, index_name, total)
 
         es.indices.refresh(index=index_name)
         count = es.count(index=index_name)["count"]
